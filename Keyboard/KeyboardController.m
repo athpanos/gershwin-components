@@ -1,5 +1,6 @@
 /*
  * Copyright (c) 2025 Simon Peter
+ * Copyright (c) 2026 Παναγιώτης Ἀθανασιάδης
  *
  * SPDX-License-Identifier: BSD-2-Clause
  */
@@ -10,6 +11,11 @@
 #import <dispatch/dispatch.h>
 
 @class KeyboardController;
+
+NSString *const KeyboardInputSourcesDidChangeNotification = @"GershwinKeyboardInputSourcesDidChange";
+
+/* XKB supports at most 4 groups (layouts) at the same time. */
+static const NSUInteger kMaxInputSources = 4;
 
 /* The pane view. When the host window gives us a width (which is not the
    560px base we built at), re-lay out the group boxes so the left/right
@@ -57,17 +63,321 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
     return [da caseInsensitiveCompare:db];
 }
 
+static NSTextField *PickerLabel(NSString *text, NSRect frame)
+{
+    NSTextField *label = [[[NSTextField alloc] initWithFrame:frame] autorelease];
+    [label setStringValue:text ?: @""];
+    [label setBezeled:NO];
+    [label setEditable:NO];
+    [label setSelectable:NO];
+    [label setDrawsBackground:NO];
+    [label setFont:[NSFont systemFontOfSize:11]];
+    return label;
+}
+
+/* ------------------------------------------------------------------------
+ * KeyboardSourcePicker
+ *
+ * The sheet shown by the "+" button: a (filterable) list of the available
+ * keyboard layouts on the left, the variants of the selected layout on the
+ * right, and Cancel / Add buttons.
+ * --------------------------------------------------------------------- */
+
+@interface KeyboardSourcePicker : NSObject <NSTableViewDataSource, NSTableViewDelegate, NSTextFieldDelegate>
+{
+    NSPanel *panel;
+    NSTextField *filterField;
+    NSTableView *layoutTable;
+    NSTableView *variantTable;
+    NSButton *addButton;
+    NSButton *cancelButton;
+
+    NSDictionary *layouts;          /* code -> description */
+    NSDictionary *variantsByLayout; /* code -> array of {code, description} */
+    NSArray *allLayouts;            /* sorted codes */
+    NSArray *shownLayouts;          /* after filtering */
+    NSArray *currentVariants;       /* variants of activeLayout */
+    NSString *activeLayout;         /* currently selected layout code or nil */
+}
+- (id)initWithLayouts:(NSDictionary *)layoutMap variants:(NSDictionary *)variantMap;
+- (NSWindow *)window;
+- (NSDictionary *)selectedSource;
+@end
+
+@implementation KeyboardSourcePicker
+
+- (id)initWithLayouts:(NSDictionary *)layoutMap variants:(NSDictionary *)variantMap
+{
+    self = [super init];
+    if (!self) {
+        return nil;
+    }
+    layouts = [layoutMap retain];
+    variantsByLayout = [variantMap retain];
+    allLayouts = [[[layouts allKeys] sortedArrayUsingFunction:LayoutComparator context:layouts] retain];
+    shownLayouts = [allLayouts retain];
+    currentVariants = [[NSArray alloc] init];
+    [self buildPanel];
+    return self;
+}
+
+- (void)dealloc
+{
+    [layoutTable setDelegate:nil];
+    [layoutTable setDataSource:nil];
+    [variantTable setDelegate:nil];
+    [variantTable setDataSource:nil];
+    [filterField setDelegate:nil];
+    [panel release];
+    [filterField release];
+    [layoutTable release];
+    [variantTable release];
+    [addButton release];
+    [cancelButton release];
+    [layouts release];
+    [variantsByLayout release];
+    [allLayouts release];
+    [shownLayouts release];
+    [currentVariants release];
+    [activeLayout release];
+    [super dealloc];
+}
+
+- (NSTableView *)addTableToView:(NSView *)parent frame:(NSRect)frame width:(CGFloat)colWidth
+{
+    NSScrollView *scroll = [[[NSScrollView alloc] initWithFrame:frame] autorelease];
+    [scroll setHasVerticalScroller:YES];
+    [scroll setHasHorizontalScroller:NO];
+    [scroll setBorderType:NSBezelBorder];
+    [parent addSubview:scroll];
+
+    NSTableView *table = [[NSTableView alloc] initWithFrame:[scroll bounds]];
+    [table setDelegate:self];
+    [table setDataSource:self];
+    [table setAllowsMultipleSelection:NO];
+    [table setAllowsEmptySelection:YES];
+    [table setHeaderView:nil];
+    [table setTarget:self];
+    [table setDoubleAction:@selector(addPressed:)];
+
+    NSTableColumn *column = [[NSTableColumn alloc] initWithIdentifier:@"name"];
+    [column setTitle:@""];
+    [column setWidth:colWidth];
+    [column setEditable:NO];
+    [table addTableColumn:column];
+    [column release];
+
+    [scroll setDocumentView:table];
+    return table; /* +1, owned by the caller */
+}
+
+- (void)buildPanel
+{
+    const CGFloat W = 520, H = 380;
+    const CGFloat margin = 20;
+    const CGFloat gap = METRICS_SPACE_8;
+    const CGFloat btnW = 80, btnH = 24, btnBottom = 16;
+    const CGFloat labelH = 18, fieldH = 22;
+
+    panel = [[NSPanel alloc] initWithContentRect:NSMakeRect(0, 0, W, H)
+                                       styleMask:NSTitledWindowMask
+                                         backing:NSBackingStoreBuffered
+                                           defer:NO];
+    [panel setReleasedWhenClosed:NO];
+    NSView *content = [panel contentView];
+
+    CGFloat y = H - margin - labelH;
+    [content addSubview:PickerLabel(@"Select a keyboard layout to add:",
+                                    NSMakeRect(margin, y, W - 2 * margin, labelH))];
+
+    y -= gap + fieldH;
+    filterField = [[NSTextField alloc] initWithFrame:NSMakeRect(margin, y, W - 2 * margin, fieldH)];
+    [filterField setPlaceholderString:@"Filter"];
+    [filterField setDelegate:self];
+    [content addSubview:filterField];
+
+    const CGFloat tablesBottom = btnBottom + btnH + 12;
+    const CGFloat tablesTop = y - gap;
+    const CGFloat tablesH = tablesTop - tablesBottom;
+    const CGFloat halfW = (W - 2 * margin - gap) / 2.0;
+
+    layoutTable = [self addTableToView:content
+                                 frame:NSMakeRect(margin, tablesBottom, halfW, tablesH)
+                                 width:halfW - 22];
+    variantTable = [self addTableToView:content
+                                  frame:NSMakeRect(margin + halfW + gap, tablesBottom, halfW, tablesH)
+                                  width:halfW - 22];
+
+    /* setDataSource: (inside addTableToView:) already queried the row count,
+       but at that point layoutTable/variantTable were still nil, so the data
+       source answered 0. Reload now that the ivars are set. */
+    [layoutTable reloadData];
+    [variantTable reloadData];
+
+    cancelButton = [[NSButton alloc] initWithFrame:
+        NSMakeRect(W - margin - 2 * btnW - gap, btnBottom, btnW, btnH)];
+    [cancelButton setTitle:@"Cancel"];
+    [cancelButton setBezelStyle:NSRoundedBezelStyle];
+    [cancelButton setTarget:self];
+    [cancelButton setAction:@selector(cancelPressed:)];
+    [cancelButton setKeyEquivalent:@"\033"];
+    [content addSubview:cancelButton];
+
+    addButton = [[NSButton alloc] initWithFrame:
+        NSMakeRect(W - margin - btnW, btnBottom, btnW, btnH)];
+    [addButton setTitle:@"Add"];
+    [addButton setBezelStyle:NSRoundedBezelStyle];
+    [addButton setTarget:self];
+    [addButton setAction:@selector(addPressed:)];
+    [addButton setKeyEquivalent:@"\r"];
+    [addButton setEnabled:NO];
+    [content addSubview:addButton];
+
+    [panel setInitialFirstResponder:filterField];
+}
+
+- (NSWindow *)window
+{
+    return panel;
+}
+
+- (IBAction)addPressed:(id)sender
+{
+    (void)sender;
+    if (!activeLayout) {
+        return;
+    }
+    [NSApp endSheet:panel returnCode:NSOKButton];
+}
+
+- (IBAction)cancelPressed:(id)sender
+{
+    (void)sender;
+    [NSApp endSheet:panel returnCode:NSCancelButton];
+}
+
+/* Returns {layout, variant} for the current selection, or nil. */
+- (NSDictionary *)selectedSource
+{
+    if (!activeLayout) {
+        return nil;
+    }
+    NSString *variant = @"";
+    NSInteger vr = [variantTable selectedRow];
+    if (vr >= 1 && (vr - 1) < (NSInteger)[currentVariants count]) {
+        NSString *code = [[currentVariants objectAtIndex:vr - 1] objectForKey:@"code"];
+        if (code) {
+            variant = code;
+        }
+    }
+    return [NSDictionary dictionaryWithObjectsAndKeys:
+            activeLayout, @"layout", variant, @"variant", nil];
+}
+
+/* Re-read the layout table selection into activeLayout / currentVariants. */
+- (void)syncActiveLayout
+{
+    NSInteger row = [layoutTable selectedRow];
+
+    [activeLayout release];
+    activeLayout = nil;
+    [currentVariants release];
+    currentVariants = nil;
+
+    if (row >= 0 && row < (NSInteger)[shownLayouts count]) {
+        activeLayout = [[shownLayouts objectAtIndex:row] retain];
+        currentVariants = [[variantsByLayout objectForKey:activeLayout] retain];
+    }
+    if (!currentVariants) {
+        currentVariants = [[NSArray alloc] init];
+    }
+
+    [variantTable reloadData];
+    if (activeLayout) {
+        [variantTable selectRowIndexes:[NSIndexSet indexSetWithIndex:0] byExtendingSelection:NO];
+    }
+    [addButton setEnabled:(activeLayout != nil)];
+}
+
+- (void)controlTextDidChange:(NSNotification *)notification
+{
+    (void)notification;
+    NSString *query = [[[filterField stringValue] lowercaseString]
+        stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+
+    NSMutableArray *result = [NSMutableArray array];
+    for (NSString *code in allLayouts) {
+        if ([query length] == 0) {
+            [result addObject:code];
+            continue;
+        }
+        NSString *desc = [[layouts objectForKey:code] lowercaseString];
+        if ([desc rangeOfString:query].location != NSNotFound ||
+            [[code lowercaseString] rangeOfString:query].location != NSNotFound) {
+            [result addObject:code];
+        }
+    }
+    [shownLayouts release];
+    shownLayouts = [result copy];
+
+    [layoutTable reloadData];
+    [layoutTable deselectAll:nil];
+    [self syncActiveLayout];
+}
+
+// NSTableView data source
+- (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView
+{
+    if (tableView == layoutTable) {
+        return [shownLayouts count];
+    } else if (tableView == variantTable) {
+        return activeLayout ? (NSInteger)[currentVariants count] + 1 : 0;
+    }
+    return 0;
+}
+
+- (id)tableView:(NSTableView *)tableView objectValueForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row
+{
+    (void)tableColumn;
+    if (tableView == layoutTable) {
+        NSString *code = [shownLayouts objectAtIndex:row];
+        NSString *desc = [layouts objectForKey:code];
+        return [NSString stringWithFormat:@"%@ (%@)", desc, code];
+    } else if (tableView == variantTable) {
+        if (row == 0) {
+            return @"Default";
+        }
+        NSDictionary *entry = [currentVariants objectAtIndex:row - 1];
+        NSString *code = [entry objectForKey:@"code"];
+        NSString *desc = [entry objectForKey:@"description"];
+        return [NSString stringWithFormat:@"%@ (%@)", desc, code];
+    }
+    return nil;
+}
+
+// NSTableView delegate
+- (void)tableViewSelectionDidChange:(NSNotification *)notification
+{
+    if ([notification object] == layoutTable) {
+        [self syncActiveLayout];
+    }
+}
+
+@end
+
+/* ------------------------------------------------------------------------
+ * KeyboardController
+ * --------------------------------------------------------------------- */
+
 @interface KeyboardController ()
 - (void)ensureMetadataLoaded;
 - (void)parseKeyboardMetadata;
 - (NSDictionary *)fallbackLayouts;
 - (NSString *)findExecutableFromCandidates:(NSArray *)candidates;
+- (NSString *)pathForTool:(NSString *)name;
 - (NSDictionary *)savedPreferences;
 - (NSDictionary *)systemKeyboardDefaults;
 - (NSDictionary *)currentXkbmapSettingsSync;
-- (void)populateLayoutTable;
-- (void)populateVariantsForLayout:(NSString *)layout;
-- (void)selectLayout:(NSString *)layout variant:(NSString *)variant;
 - (BOOL)applyLayout:(NSString *)layout variant:(NSString *)variant options:(NSString *)options error:(NSString **)error;
 - (void)persistUserDefaultsLayout:(NSString *)layout variant:(NSString *)variant options:(NSString *)options keyboardType:(NSString *)keyboardType isApple:(BOOL)isApple;
 - (void)writeUserAutostartWithLayout:(NSString *)layout variant:(NSString *)variant options:(NSString *)options keyboardType:(NSString *)keyboardType isApple:(BOOL)isApple;
@@ -78,6 +388,17 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
 - (void)updateStatus:(NSString *)message;
 - (void)showAlertWithTitle:(NSString *)title text:(NSString *)text;
 
+/* Input sources model. */
+- (NSArray *)sourcesFromLayoutString:(NSString *)layout variantString:(NSString *)variant;
+- (NSArray *)sanitizedSources:(NSArray *)raw;
+- (NSString *)joinedLayoutsForSources:(NSArray *)sources;
+- (NSString *)joinedVariantsForSources:(NSArray *)sources;
+- (NSString *)summaryForSources:(NSArray *)sources;
+- (NSString *)displayNameForSource:(NSDictionary *)source;
+- (NSInteger)indexOfSourceWithLayout:(NSString *)layout variant:(NSString *)variant;
+- (void)updateSourceButtons;
+- (void)addSheetDidEnd:(NSWindow *)sheet returnCode:(NSInteger)returnCode contextInfo:(void *)contextInfo;
+
 /* Layout helpers (HIG group boxes and rows). */
 - (NSBox *)groupBoxWithTitle:(NSString *)title frame:(NSRect)frame inView:(NSView *)parent;
 - (NSTextField *)labelWithText:(NSString *)text frame:(NSRect)frame alignment:(NSTextAlignment)align;
@@ -87,6 +408,7 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
                       toBox:(NSBox *)box
                           y:(CGFloat)y
                       width:(CGFloat)w;
+- (NSButton *)sourceButtonWithTitle:(NSString *)title action:(SEL)action frame:(NSRect)frame;
 @end
 
 @implementation KeyboardController
@@ -96,6 +418,7 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
     self = [super init];
     if (self) {
         isRefreshing = YES;  // Start in refresh mode to prevent unwanted writes during initialization
+        inputSources = [[NSMutableArray alloc] init];
         NSDebugLog(@"[Keyboard] Controller init, isRefreshing set to YES");
     }
     return self;
@@ -104,10 +427,10 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
 - (void)dealloc
 {
     [mainView release];
-    [layoutTable release];
-    [variantTable release];
-    [layoutScroll release];
-    [variantScroll release];
+    [sourcesTable release];
+    [sourcesScroll release];
+    [addSourceButton release];
+    [removeSourceButton release];
     [statusLabel release];
     [tryTextField release];
     [isAppleKeyboardCheckbox release];
@@ -115,8 +438,8 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
     [layouts release];
     [variantsByLayout release];
     [setxkbmapPath release];
-    [sortedLayouts release];
-    [currentVariants release];
+    [inputSources release];
+    [sourcePicker release];
     [lastAppliedLayout release];
     [lastAppliedVariant release];
     [lastAppliedKeyboardType release];
@@ -177,55 +500,44 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
         [keyboardTypePopup setAction:@selector(keyboardTypeChanged:)];
     }
 
-    /* ---- Layout + variant tables, side by side (no group box),
+    /* ---- Input sources table with +/- buttons underneath (like macOS),
              filling the space between the box and the try field ---- */
     {
-        const CGFloat gap = METRICS_SPACE_8;
         const CGFloat tryFieldY = bottomMargin + statusH + METRICS_SPACE_8;
         const CGFloat tablesBottom = tryFieldY + tryFieldH + boxGap;
         const CGFloat tablesTop = winH - topMargin - keyboardTypeBoxH - boxGap;
-        const CGFloat tablesH = tablesTop - tablesBottom;
-        const CGFloat halfW = (boxW - gap) / 2.0;
+        const CGFloat buttonW = 26, buttonH = 22;
+        const CGFloat scrollBottom = tablesBottom + buttonH;
+        const CGFloat scrollH = tablesTop - scrollBottom;
 
-        layoutScroll = [[NSScrollView alloc] initWithFrame:
-            NSMakeRect(sideMargin, tablesBottom, halfW, tablesH)];
-        [layoutScroll setHasVerticalScroller:YES];
-        [layoutScroll setHasHorizontalScroller:NO];
-        [layoutScroll setBorderType:NSBezelBorder];
-        [mainView addSubview:layoutScroll];
+        sourcesScroll = [[NSScrollView alloc] initWithFrame:
+            NSMakeRect(sideMargin, scrollBottom, boxW, scrollH)];
+        [sourcesScroll setHasVerticalScroller:YES];
+        [sourcesScroll setHasHorizontalScroller:NO];
+        [sourcesScroll setBorderType:NSBezelBorder];
+        [mainView addSubview:sourcesScroll];
 
-        layoutTable = [[NSTableView alloc] initWithFrame:[layoutScroll bounds]];
-        [layoutTable setDelegate:self];
-        [layoutTable setDataSource:self];
-        [layoutTable setAllowsMultipleSelection:NO];
-        [layoutTable setAllowsEmptySelection:NO];
-        NSTableColumn *layoutColumn = [[NSTableColumn alloc] initWithIdentifier:@"layout"];
-        [layoutColumn setTitle:@""];
-        [layoutColumn setWidth:250];
-        [layoutColumn setEditable:NO];
-        [layoutTable addTableColumn:layoutColumn];
-        [layoutColumn release];
-        [layoutScroll setDocumentView:layoutTable];
+        sourcesTable = [[NSTableView alloc] initWithFrame:[sourcesScroll bounds]];
+        [sourcesTable setDelegate:self];
+        [sourcesTable setDataSource:self];
+        [sourcesTable setAllowsMultipleSelection:NO];
+        [sourcesTable setAllowsEmptySelection:YES];
+        [sourcesTable setHeaderView:nil];
+        NSTableColumn *sourceColumn = [[NSTableColumn alloc] initWithIdentifier:@"source"];
+        [sourceColumn setTitle:@""];
+        [sourceColumn setWidth:boxW - 22];
+        [sourceColumn setEditable:NO];
+        [sourcesTable addTableColumn:sourceColumn];
+        [sourceColumn release];
+        [sourcesScroll setDocumentView:sourcesTable];
 
-        variantScroll = [[NSScrollView alloc] initWithFrame:
-            NSMakeRect(sideMargin + halfW + gap, tablesBottom, halfW, tablesH)];
-        [variantScroll setHasVerticalScroller:YES];
-        [variantScroll setHasHorizontalScroller:NO];
-        [variantScroll setBorderType:NSBezelBorder];
-        [mainView addSubview:variantScroll];
-
-        variantTable = [[NSTableView alloc] initWithFrame:[variantScroll bounds]];
-        [variantTable setDelegate:self];
-        [variantTable setDataSource:self];
-        [variantTable setAllowsMultipleSelection:NO];
-        [variantTable setAllowsEmptySelection:YES];
-        NSTableColumn *variantColumn = [[NSTableColumn alloc] initWithIdentifier:@"variant"];
-        [variantColumn setTitle:@""];
-        [variantColumn setWidth:210];
-        [variantColumn setEditable:NO];
-        [variantTable addTableColumn:variantColumn];
-        [variantColumn release];
-        [variantScroll setDocumentView:variantTable];
+        addSourceButton = [self sourceButtonWithTitle:@"+"
+                                               action:@selector(addSourceClicked:)
+                                                frame:NSMakeRect(sideMargin, tablesBottom, buttonW, buttonH)];
+        removeSourceButton = [self sourceButtonWithTitle:@"-"
+                                                  action:@selector(removeSourceClicked:)
+                                                   frame:NSMakeRect(sideMargin + buttonW - 1, tablesBottom, buttonW, buttonH)];
+        [removeSourceButton setEnabled:NO];
     }
 
     /* ---- Try text field directly on the view (single item, no box) ---- */
@@ -251,7 +563,6 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
     [statusLabel setAutoresizingMask:(NSViewWidthSizable | NSViewMaxYMargin)];
     [mainView addSubview:statusLabel];
 
-    [self populateLayoutTable];
     [self refreshFromSystem];
 
     return mainView;
@@ -271,17 +582,13 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
         f.size.width = width - 2 * sideMargin;
         [keyboardTypeBox setFrame:f];
     }
-    if (layoutScroll && variantScroll) {
-        const CGFloat gap = METRICS_SPACE_8;
-        const CGFloat halfW = (width - 2 * sideMargin - gap) / 2.0;
-        f = [layoutScroll frame];
+    if (sourcesScroll) {
+        f = [sourcesScroll frame];
         f.origin.x = sideMargin;
-        f.size.width = halfW;
-        [layoutScroll setFrame:f];
-        f = [variantScroll frame];
-        f.origin.x = sideMargin + halfW + gap;
-        f.size.width = halfW;
-        [variantScroll setFrame:f];
+        f.size.width = width - 2 * sideMargin;
+        [sourcesScroll setFrame:f];
+        NSTableColumn *col = [sourcesTable tableColumnWithIdentifier:@"source"];
+        [col setWidth:f.size.width - 22];
     }
     if (tryTextField) {
         f = [tryTextField frame];
@@ -358,6 +665,20 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
     [popup setFrame:NSMakeRect(pad + labelW + gap, y, popupW, 22)];
     [popup setAutoresizingMask:NSViewWidthSizable];
     [box addSubview:popup];
+}
+
+/* A small square "+" / "-" button attached to the bottom of the table.
+   Returns an owned (+1) button, also added to mainView. */
+- (NSButton *)sourceButtonWithTitle:(NSString *)title action:(SEL)action frame:(NSRect)frame
+{
+    NSButton *button = [[NSButton alloc] initWithFrame:frame];
+    [button setTitle:title];
+    [button setBezelStyle:NSSmallSquareBezelStyle];
+    [button setButtonType:NSMomentaryPushInButton];
+    [button setTarget:self];
+    [button setAction:action];
+    [mainView addSubview:button];
+    return button;
 }
 
 - (void)ensureMetadataLoaded
@@ -504,6 +825,30 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
     return nil;
 }
 
+/* Locate an executable in the usual system directories and in $PATH.
+   (/usr/bin/<tool> is not where every system keeps it, e.g. /usr/local/bin.) */
+- (NSString *)pathForTool:(NSString *)name
+{
+    NSFileManager *fm = [NSFileManager defaultManager];
+    NSMutableArray *dirs = [NSMutableArray arrayWithObjects:
+                            @"/usr/local/bin", @"/usr/bin", @"/bin",
+                            @"/usr/local/sbin", @"/usr/sbin", @"/sbin", nil];
+    NSString *pathEnv = [[[NSProcessInfo processInfo] environment] objectForKey:@"PATH"];
+    if ([pathEnv length]) {
+        [dirs addObjectsFromArray:[pathEnv componentsSeparatedByString:@":"]];
+    }
+    for (NSString *dir in dirs) {
+        if (![dir length]) {
+            continue;
+        }
+        NSString *candidate = [dir stringByAppendingPathComponent:name];
+        if ([fm isExecutableFileAtPath:candidate]) {
+            return candidate;
+        }
+    }
+    return nil;
+}
+
 - (NSDictionary *)savedPreferences
 {
     NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
@@ -583,46 +928,248 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
     return result;
 }
 
-- (void)populateLayoutTable
+#pragma mark - Input sources model
+
+/* Build a source list from XKB-style comma separated layout/variant strings
+   ("us,gr" / ",polytonic"). Empty variant slots are preserved so that the
+   layout <-> variant pairing stays positional. */
+- (NSArray *)sourcesFromLayoutString:(NSString *)layout variantString:(NSString *)variant
 {
-    [sortedLayouts release];
-    sortedLayouts = [[layouts allKeys] sortedArrayUsingFunction:LayoutComparator context:layouts];
-    [sortedLayouts retain];
-    [layoutTable reloadData];
+    NSMutableArray *result = [NSMutableArray array];
+    if (![layout length]) {
+        return result;
+    }
+    NSArray *ls = [layout componentsSeparatedByString:@","];
+    NSArray *vs = [variant length] ? [variant componentsSeparatedByString:@","] : [NSArray array];
+
+    for (NSUInteger i = 0; i < [ls count]; i++) {
+        NSString *l = [self trimmed:[ls objectAtIndex:i]];
+        if (![l length]) {
+            continue;
+        }
+        NSString *v = (i < [vs count]) ? [self trimmed:[vs objectAtIndex:i]] : @"";
+        [result addObject:[NSDictionary dictionaryWithObjectsAndKeys:l, @"layout", v, @"variant", nil]];
+    }
+    return result;
 }
 
-- (void)populateVariantsForLayout:(NSString *)layout
+/* Validate and normalise a list read from the preferences. */
+- (NSArray *)sanitizedSources:(NSArray *)raw
 {
-    [currentVariants release];
-    currentVariants = [[variantsByLayout objectForKey:layout] retain];
-    if (!currentVariants) {
-        currentVariants = [[NSArray array] retain];
+    NSMutableArray *result = [NSMutableArray array];
+    if (![raw isKindOfClass:[NSArray class]]) {
+        return result;
     }
-    [variantTable reloadData];
+    for (id item in raw) {
+        if (![item isKindOfClass:[NSDictionary class]]) {
+            continue;
+        }
+        NSString *l = [item objectForKey:@"layout"];
+        NSString *v = [item objectForKey:@"variant"];
+        if (![l isKindOfClass:[NSString class]] || ![l length]) {
+            continue;
+        }
+        if (![v isKindOfClass:[NSString class]]) {
+            v = @"";
+        }
+        [result addObject:[NSDictionary dictionaryWithObjectsAndKeys:l, @"layout", v, @"variant", nil]];
+        if ([result count] >= kMaxInputSources) {
+            break;
+        }
+    }
+    return result;
 }
+
+- (NSString *)joinedLayoutsForSources:(NSArray *)sources
+{
+    NSMutableArray *parts = [NSMutableArray array];
+    for (NSDictionary *s in sources) {
+        [parts addObject:[s objectForKey:@"layout"]];
+    }
+    return [parts componentsJoinedByString:@","];
+}
+
+/* Positional variant list; @"" when no source uses a variant at all. */
+- (NSString *)joinedVariantsForSources:(NSArray *)sources
+{
+    NSMutableArray *parts = [NSMutableArray array];
+    BOOL any = NO;
+    for (NSDictionary *s in sources) {
+        NSString *v = [s objectForKey:@"variant"];
+        if (!v) {
+            v = @"";
+        }
+        if ([v length]) {
+            any = YES;
+        }
+        [parts addObject:v];
+    }
+    return any ? [parts componentsJoinedByString:@","] : @"";
+}
+
+/* "us, gr/polytonic" */
+- (NSString *)summaryForSources:(NSArray *)sources
+{
+    NSMutableArray *parts = [NSMutableArray array];
+    for (NSDictionary *s in sources) {
+        NSString *v = [s objectForKey:@"variant"];
+        if ([v length]) {
+            [parts addObject:[NSString stringWithFormat:@"%@/%@", [s objectForKey:@"layout"], v]];
+        } else {
+            [parts addObject:[s objectForKey:@"layout"]];
+        }
+    }
+    return [parts componentsJoinedByString:@", "];
+}
+
+/* Human readable name for a table row, e.g. "Greek (polytonic)". */
+- (NSString *)displayNameForSource:(NSDictionary *)source
+{
+    NSString *layout = [source objectForKey:@"layout"];
+    NSString *variant = [source objectForKey:@"variant"];
+
+    if ([variant length]) {
+        NSArray *list = [variantsByLayout objectForKey:layout];
+        for (NSDictionary *entry in list) {
+            if ([[entry objectForKey:@"code"] isEqualToString:variant]) {
+                return [entry objectForKey:@"description"];
+            }
+        }
+        return [NSString stringWithFormat:@"%@ (%@)", layout, variant];
+    }
+    NSString *desc = [layouts objectForKey:layout];
+    return desc ? desc : layout;
+}
+
+- (NSInteger)indexOfSourceWithLayout:(NSString *)layout variant:(NSString *)variant
+{
+    NSString *v = variant ? variant : @"";
+    for (NSUInteger i = 0; i < [inputSources count]; i++) {
+        NSDictionary *s = [inputSources objectAtIndex:i];
+        NSString *sv = [s objectForKey:@"variant"];
+        if (!sv) {
+            sv = @"";
+        }
+        if ([[s objectForKey:@"layout"] isEqualToString:layout] && [sv isEqualToString:v]) {
+            return (NSInteger)i;
+        }
+    }
+    return -1;
+}
+
+- (void)updateSourceButtons
+{
+    NSInteger row = [sourcesTable selectedRow];
+    [removeSourceButton setEnabled:(row >= 0 && [inputSources count] > 1)];
+    [addSourceButton setEnabled:([inputSources count] < kMaxInputSources)];
+}
+
+#pragma mark - Add / remove
+
+- (IBAction)addSourceClicked:(id)sender
+{
+    (void)sender;
+    if (isRefreshing || sourcePicker) {
+        return;
+    }
+    [self ensureMetadataLoaded];
+
+    if ([inputSources count] >= kMaxInputSources) {
+        [self showAlertWithTitle:@"Too many keyboard layouts"
+                            text:[NSString stringWithFormat:
+                                  @"At most %lu keyboard layouts can be active at the same time.",
+                                  (unsigned long)kMaxInputSources]];
+        return;
+    }
+
+    NSWindow *host = [mainView window];
+    if (!host) {
+        return;
+    }
+
+    sourcePicker = [[KeyboardSourcePicker alloc] initWithLayouts:layouts variants:variantsByLayout];
+    [NSApp beginSheet:[sourcePicker window]
+       modalForWindow:host
+        modalDelegate:self
+       didEndSelector:@selector(addSheetDidEnd:returnCode:contextInfo:)
+          contextInfo:NULL];
+}
+
+- (void)addSheetDidEnd:(NSWindow *)sheet returnCode:(NSInteger)returnCode contextInfo:(void *)contextInfo
+{
+    (void)contextInfo;
+    [sheet orderOut:nil];
+
+    NSDictionary *source = (returnCode == NSOKButton) ? [sourcePicker selectedSource] : nil;
+    [sourcePicker release];
+    sourcePicker = nil;
+
+    if (!source) {
+        return;
+    }
+
+    NSString *layout = [source objectForKey:@"layout"];
+    NSString *variant = [source objectForKey:@"variant"];
+
+    NSInteger existing = [self indexOfSourceWithLayout:layout variant:variant];
+    if (existing >= 0) {
+        [sourcesTable selectRowIndexes:[NSIndexSet indexSetWithIndex:existing] byExtendingSelection:NO];
+        [self showAlertWithTitle:@"Already added"
+                            text:@"This keyboard layout is already in the list."];
+        return;
+    }
+    if ([inputSources count] >= kMaxInputSources) {
+        return;
+    }
+
+    [inputSources addObject:source];
+    [sourcesTable reloadData];
+    NSInteger last = (NSInteger)[inputSources count] - 1;
+    [sourcesTable selectRowIndexes:[NSIndexSet indexSetWithIndex:last] byExtendingSelection:NO];
+    [sourcesTable scrollRowToVisible:last];
+    [self updateSourceButtons];
+    [self applySelection:nil];
+}
+
+- (IBAction)removeSourceClicked:(id)sender
+{
+    (void)sender;
+    if (isRefreshing) {
+        return;
+    }
+    NSInteger row = [sourcesTable selectedRow];
+    if (row < 0 || row >= (NSInteger)[inputSources count] || [inputSources count] <= 1) {
+        return;
+    }
+
+    [inputSources removeObjectAtIndex:row];
+    [sourcesTable reloadData];
+
+    NSInteger count = (NSInteger)[inputSources count];
+    if (count > 0) {
+        NSInteger newRow = (row < count) ? row : count - 1;
+        [sourcesTable selectRowIndexes:[NSIndexSet indexSetWithIndex:newRow] byExtendingSelection:NO];
+    }
+    [self updateSourceButtons];
+    [self applySelection:nil];
+}
+
+#pragma mark - NSTableView
 
 // NSTableView data source methods
 - (NSInteger)numberOfRowsInTableView:(NSTableView *)tableView
 {
-    if (tableView == layoutTable) {
-        return [sortedLayouts count];
-    } else if (tableView == variantTable) {
-        return [currentVariants count];
+    if (tableView == sourcesTable) {
+        return [inputSources count];
     }
     return 0;
 }
 
 - (id)tableView:(NSTableView *)tableView objectValueForTableColumn:(NSTableColumn *)tableColumn row:(NSInteger)row
 {
-    if (tableView == layoutTable) {
-        NSString *code = [sortedLayouts objectAtIndex:row];
-        NSString *desc = [layouts objectForKey:code];
-        return [NSString stringWithFormat:@"%@ (%@)", desc, code];
-    } else if (tableView == variantTable) {
-        NSDictionary *entry = [currentVariants objectAtIndex:row];
-        NSString *code = [entry objectForKey:@"code"];
-        NSString *desc = [entry objectForKey:@"description"];
-        return [NSString stringWithFormat:@"%@ (%@)", desc, code];
+    (void)tableColumn;
+    if (tableView == sourcesTable && row >= 0 && row < (NSInteger)[inputSources count]) {
+        return [self displayNameForSource:[inputSources objectAtIndex:row]];
     }
     return nil;
 }
@@ -630,75 +1177,8 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
 // NSTableView delegate methods
 - (void)tableViewSelectionDidChange:(NSNotification *)notification
 {
-    NSDebugLog(@"[Keyboard] tableViewSelectionDidChange: isRefreshing=%d", isRefreshing);
-    if (isRefreshing) {
-        NSDebugLog(@"[Keyboard] Ignoring table selection change during refresh");
-        return;
-    }
-    NSTableView *tableView = [notification object];
-    if (tableView == layoutTable) {
-        NSInteger selectedRow = [layoutTable selectedRow];
-        if (selectedRow >= 0 && selectedRow < (NSInteger)[sortedLayouts count]) {
-            NSString *layout = [sortedLayouts objectAtIndex:selectedRow];
-            NSDebugLog(@"[Keyboard] Layout table selection changed to row %ld: '%@'", (long)selectedRow, layout);
-            [self populateVariantsForLayout:layout];
-            [variantTable deselectAll:nil];
-            [self applySelection:nil];
-        }
-    } else if (tableView == variantTable) {
-        NSInteger selectedRow = [variantTable selectedRow];
-        NSDebugLog(@"[Keyboard] Variant table selection changed to row %ld", (long)selectedRow);
-        [self applySelection:nil];
-    }
-}
-
-- (void)selectLayout:(NSString *)layout variant:(NSString *)variant
-{
-    NSDebugLog(@"[Keyboard] selectLayout: layout='%@' variant='%@' isRefreshing=%d", layout, variant, isRefreshing);
-    if (![layout length]) {
-        layout = @"us";
-    }
-
-    // ensure layout exists, otherwise fall back
-    if (![layouts objectForKey:layout]) {
-        NSDebugLog(@"[Keyboard] Layout '%@' not found in layouts dictionary", layout);
-        NSArray *allKeys = [layouts allKeys];
-        if ([allKeys containsObject:@"us"]) {
-            NSDebugLog(@"[Keyboard] Falling back to 'us'");
-            layout = @"us";
-        } else if ([allKeys count] > 0) {
-            NSDebugLog(@"[Keyboard] Falling back to first available layout");
-            layout = [allKeys objectAtIndex:0];
-        }
-    }
-
-    // Select layout in table
-    NSInteger layoutIndex = [sortedLayouts indexOfObject:layout];
-    NSDebugLog(@"[Keyboard] Looking for layout '%@' in sortedLayouts, index=%ld", layout, (long)layoutIndex);
-    if (layoutIndex != NSNotFound) {
-        [layoutTable selectRowIndexes:[NSIndexSet indexSetWithIndex:layoutIndex] byExtendingSelection:NO];
-        [layoutTable scrollRowToVisible:layoutIndex];
-    }
-
-    [self populateVariantsForLayout:layout];
-
-    // Select variant in table
-    NSInteger variantIndex = NSNotFound;
-    if ([variant length]) {
-        for (NSUInteger i = 0; i < [currentVariants count]; i++) {
-            NSDictionary *entry = [currentVariants objectAtIndex:i];
-            if ([[entry objectForKey:@"code"] isEqualToString:variant]) {
-                variantIndex = i;
-                break;
-            }
-        }
-    }
-    NSDebugLog(@"[Keyboard] Looking for variant '%@', index=%ld", variant, (long)variantIndex);
-    if (variantIndex != NSNotFound) {
-        [variantTable selectRowIndexes:[NSIndexSet indexSetWithIndex:variantIndex] byExtendingSelection:NO];
-        [variantTable scrollRowToVisible:variantIndex];
-    } else {
-        [variantTable deselectAll:nil];
+    if ([notification object] == sourcesTable) {
+        [self updateSourceButtons];
     }
 }
 
@@ -787,7 +1267,14 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
         return;
     }
     NSDebugLog(@"[Keyboard] persistUserDefaultsLayout: layout='%@' variant='%@' options='%@' keyboardType='%@' isApple=%d", layout, variant, options, keyboardType, isApple);
-    NSMutableDictionary *domain = [NSMutableDictionary dictionary];
+
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+
+    /* Start from the existing domain so that other keys stored there (for
+       example a future switching shortcut) are not wiped out. */
+    NSDictionary *existing = [defaults persistentDomainForName:kKeyboardDomain];
+    NSMutableDictionary *domain = existing ? [NSMutableDictionary dictionaryWithDictionary:existing]
+                                           : [NSMutableDictionary dictionary];
     if (layout) {
         [domain setObject:layout forKey:@"layout"];
     }
@@ -802,7 +1289,23 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
     }
     [domain setObject:[NSNumber numberWithBool:isApple] forKey:@"isApple"];
 
-    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    /* Source of truth for the list of input sources (XKB group order).
+       "layout" / "variant" above hold the same data joined with commas. */
+    if ([inputSources count]) {
+        /* "name" is only for display (e.g. in the menu bar extra), so that
+           other components do not have to parse base.lst themselves. */
+        NSMutableArray *stored = [NSMutableArray array];
+        for (NSDictionary *s in inputSources) {
+            NSString *v = [s objectForKey:@"variant"];
+            [stored addObject:[NSDictionary dictionaryWithObjectsAndKeys:
+                               [s objectForKey:@"layout"], @"layout",
+                               (v ? v : @""), @"variant",
+                               [self displayNameForSource:s], @"name",
+                               nil]];
+        }
+        [domain setObject:stored forKey:@"inputSources"];
+    }
+
     [defaults setPersistentDomain:domain forName:kKeyboardDomain];
     [defaults synchronize];
 }
@@ -863,8 +1366,13 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
      * For German (de) layout specifically:
      *   - Keycode 49 should produce: < > (less/greater with bar/dagger on level 3/4)
      *   - Keycode 94 should produce: ^ ° (circumflex/degree with notsign on level 3)
+     *
+     * NOTE: these xmodmap commands hard-code Latin keysyms and would overwrite the
+     * symbols of every XKB group. They are therefore only applied when a single
+     * layout is active.
      */
-    if (isApple && [keyboardType isEqualToString:@"ISO"]) {
+    BOOL singleLayout = ([layout rangeOfString:@","].location == NSNotFound);
+    if (isApple && [keyboardType isEqualToString:@"ISO"] && singleLayout) {
         [script appendString:@"\n# Fix Apple ISO keyboard TLDE/LSGT swap\n"];
         [script appendString:@"if command -v xmodmap >/dev/null 2>&1; then\n"];
         [script appendString:@"  xmodmap -e 'keycode 49 = less greater less greater bar dagger bar' >/dev/null 2>&1 || true\n"];
@@ -915,8 +1423,8 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
         return NO;
     }
 
-    NSString *sudoPath = @"/usr/bin/sudo";
-    if (![fm isExecutableFileAtPath:sudoPath]) {
+    NSString *sudoPath = [self pathForTool:@"sudo"];
+    if (!sudoPath) {
         [fm removeItemAtPath:tmpPath error:nil];
         if (error) {
             *error = @"sudo not available";
@@ -1031,15 +1539,14 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
     }
     [self ensureMetadataLoaded];
 
-    NSInteger layoutRow = [layoutTable selectedRow];
-    NSString *layout = (layoutRow >= 0 && layoutRow < (NSInteger)[sortedLayouts count]) ? [sortedLayouts objectAtIndex:layoutRow] : nil;
-
-    NSInteger variantRow = [variantTable selectedRow];
-    NSString *variant = nil;
-    if (variantRow >= 0 && variantRow < (NSInteger)[currentVariants count]) {
-        NSDictionary *entry = [currentVariants objectAtIndex:variantRow];
-        variant = [entry objectForKey:@"code"];
+    if ([inputSources count] == 0) {
+        return;
     }
+
+    /* XKB groups: "us,gr" / ",polytonic" - one entry per input source. */
+    NSString *layout = [self joinedLayoutsForSources:inputSources];
+    NSString *variant = [self joinedVariantsForSources:inputSources];
+    BOOL multipleSources = ([inputSources count] > 1);
 
     NSString *options = @"";
     if ([isAppleKeyboardCheckbox state] == NSOnState) {
@@ -1057,17 +1564,21 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
     NSString *layoutCopy  = [layout copy];
     NSString *variantCopy = [variant copy];
     NSString *optionsCopy = [options copy];
+    NSString *summaryCopy = [[self summaryForSources:inputSources] copy];
 
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSString *applyError = nil;
         BOOL success = [self applyLayout:layoutCopy variant:variantCopy options:optionsCopy error:&applyError];
         NSString *errorCopy = [applyError copy];
 
-        // Apple ISO TLDE/LSGT swap
-        if (success && isApple && [keyboardType isEqualToString:@"ISO"]) {
+        // Apple ISO TLDE/LSGT swap (single layout only, see writeUserAutostart...)
+        if (success && isApple && !multipleSources && [keyboardType isEqualToString:@"ISO"]) {
             NSDebugLog(@"[Keyboard] Applying TLDE/LSGT swap for Apple ISO keyboard");
-            NSTask *xmodmapTask = [[NSTask alloc] init];
-            [xmodmapTask setLaunchPath:@"/usr/bin/xmodmap"];
+            /* If xmodmap is not installed xmodmapPath is nil, xmodmapTask stays
+               nil and every message below is a harmless no-op. */
+            NSString *xmodmapPath = [self pathForTool:@"xmodmap"];
+            NSTask *xmodmapTask = xmodmapPath ? [[NSTask alloc] init] : nil;
+            [xmodmapTask setLaunchPath:xmodmapPath];
             [xmodmapTask setArguments:[NSArray arrayWithObjects:
                 @"-e", @"keycode 49 = less greater less greater bar dagger bar",
                 @"-e", @"keycode 94 = asciicircum degree asciicircum degree notsign notsign notsign",
@@ -1085,6 +1596,7 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
                 [layoutCopy release];
                 [variantCopy release];
                 [optionsCopy release];
+                [summaryCopy release];
                 [keyboardType release];
                 return;
             }
@@ -1096,10 +1608,7 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
             NSString *systemError = nil;
             BOOL systemUpdated = [self updateSystemKeyboardFileWithLayout:layoutCopy variant:variantCopy options:optionsCopy keyboardType:keyboardType isApple:isApple error:&systemError];
 
-            NSMutableString *status = [NSMutableString stringWithFormat:@"Active layout: %@", layoutCopy];
-            if ([variantCopy length]) {
-                [status appendFormat:@" / %@", variantCopy];
-            }
+            NSMutableString *status = [NSMutableString stringWithFormat:@"Active layouts: %@", summaryCopy];
             if ([keyboardType length]) {
                 [status appendFormat:@" (%@)", keyboardType];
             }
@@ -1112,11 +1621,22 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
                     [status appendFormat:@" (%@)", systemError];
                 }
             }
+            if (isApple && multipleSources && [keyboardType isEqualToString:@"ISO"]) {
+                [status appendString:@" Apple ISO key swap is not applied with several layouts."];
+            }
 
             [self updateStatus:status];
+
+            /* Let other components (menu extra, switcher) know. */
+            [[NSDistributedNotificationCenter defaultCenter]
+                postNotificationName:KeyboardInputSourcesDidChangeNotification
+                              object:nil
+                            userInfo:nil];
+
             [layoutCopy release];
             [variantCopy release];
             [optionsCopy release];
+            [summaryCopy release];
             [keyboardType release];
         });
     });
@@ -1153,12 +1673,6 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
                 variant = [xkbCurrent objectForKey:@"variant"];
                 options = [xkbCurrent objectForKey:@"options"];
                 NSDebugLog(@"[Keyboard] Current XKB: layout='%@' variant='%@' options='%@'", layout, variant, options);
-                if ([layout rangeOfString:@","].location != NSNotFound) {
-                    layout = [[layout componentsSeparatedByString:@","] objectAtIndex:0];
-                }
-                if ([variant rangeOfString:@","].location != NSNotFound) {
-                    variant = [[variant componentsSeparatedByString:@","] objectAtIndex:0];
-                }
             }
 
             // If still empty, try saved preferences
@@ -1188,8 +1702,26 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
                 }
             }
 
+            /* Input sources: the list saved by this pane wins; otherwise
+               build it from the comma separated XKB layout/variant strings. */
+            NSArray *newSources = [self sanitizedSources:[saved objectForKey:@"inputSources"]];
+            if ([newSources count] == 0) {
+                newSources = [self sourcesFromLayoutString:layout variantString:variant];
+                if ([newSources count] > kMaxInputSources) {
+                    newSources = [newSources subarrayWithRange:NSMakeRange(0, kMaxInputSources)];
+                }
+            }
+            if ([newSources count] == 0) {
+                newSources = [NSArray arrayWithObject:
+                    [NSDictionary dictionaryWithObjectsAndKeys:@"us", @"layout", @"", @"variant", nil]];
+            }
+            [inputSources removeAllObjects];
+            [inputSources addObjectsFromArray:newSources];
+            [sourcesTable reloadData];
+            [sourcesTable deselectAll:nil];
+            [self updateSourceButtons];
+
             NSDebugLog(@"[Keyboard] Final values to select: layout='%@' variant='%@' options='%@' keyboardType='%@'", layout, variant, options, keyboardType);
-            [self selectLayout:layout variant:variant];
 
             // Determine Apple state
             BOOL modelIndicatesApple = NO;
@@ -1214,10 +1746,7 @@ static NSComparisonResult LayoutComparator(id a, id b, void *context)
                 [keyboardTypePopup selectItemAtIndex:0];
             }
 
-            NSMutableString *status = [NSMutableString stringWithFormat:@"Current layout: %@", layout ? layout : @"(unknown)"];
-            if ([variant length]) {
-                [status appendFormat:@" / %@", variant];
-            }
+            NSMutableString *status = [NSMutableString stringWithFormat:@"Current layouts: %@", [self summaryForSources:inputSources]];
             if ([keyboardType length]) {
                 [status appendFormat:@" (%@)", keyboardType];
             }
